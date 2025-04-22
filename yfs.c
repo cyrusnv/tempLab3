@@ -18,7 +18,12 @@ int dbcount = 0; // The number of data blocks in the file system.
 int setupServer();
 struct inode* readInode(int inumber);
 void printisdbtaken();
-
+void testInodeAllocation();
+void testInodeDeallocation();
+int inInodeCache(int inodenum);
+int addInodeToCache(struct inode *node, int nodenum);
+int editInodeInCache(struct inode *node, int nodenum);
+int deallocInodeInCache(int nodenum);
 
 
 // The main loop that runs the server
@@ -53,6 +58,8 @@ int main(int argc, char *argv[]) {
 
     // Now that startup is beginning, and assuming the file system is formatted, so some initial setup
     setupServer();
+    testInodeAllocation();
+    testInodeDeallocation();
     
     // Non-child server loop
     while (1) {
@@ -151,7 +158,7 @@ int setupServer() {
     for (int i = 1; i < header->num_inodes; i++) {
         struct inode *node = readInode(i);
         if (node->size > 0) { //if the inode points to something taking up space
-            int fileblockcount = (int)ceil(node->size / BLOCKSIZE); // Round up for the last partially-filled block
+            int fileblockcount = (node->size + BLOCKSIZE - 1) / BLOCKSIZE; // Round up for the last partially-filled block
             // Case 1: we do not have to worry about indirect blocks
             if (fileblockcount <= (NUM_DIRECT)) {
                 for (int j = 0; j < fileblockcount; j++) {
@@ -181,10 +188,81 @@ int setupServer() {
         }
     }
 
-    printisdbtaken();
+    // Testing why block 7 is not free, but block six is. It's per the root node spec. We're fine.
+    // struct inode* root = readInode(ROOTINODE); // ROOTINODE is defined as 1
+    // TracePrintf(0, "Root inode: type=%d, size=%d, direct[0]=%d\n", 
+    //        root->type, root->size, root->direct[0]);
+    // free(root);
+
+    // Testing post-setup.
+    //printisdbtaken();
 
     return 1;
 }
+
+
+
+
+
+
+
+
+/* BLOCK MANAGEMENT FUNCTIONS */
+
+int allocBlock() {
+
+    int newinodenum = -1;
+
+    // Find a free inode
+    for (int i = 1; i < header->num_inodes; i++) {
+        if (!isinodetaken[i]) {
+            newinodenum = i;
+            break;
+        }
+    }
+
+    if (newinodenum == -1) {
+        TracePrintf(1, "WARNING: NO MORE FREE INODES.");
+        return -1;
+    }
+
+    if (inInodeCache(newinodenum)) {
+        editInodeInCache(newnode, newinodenum);
+    } else {
+        int block = blockFromInode(newinodenum);
+        int blockpos = inodePosInBlock(newinodenum);
+
+        void *buff = malloc(SECTORSIZE);
+        ReadSector(block, buff);
+        struct inode *blockbuff = (struct inode*)buff;
+
+        // Change strictly the values that correspond to the specific inode we want to change
+        blockbuff[blockpos].type = newnode->type;
+        blockbuff[blockpos].nlink = newnode->nlink;
+        blockbuff[blockpos].reuse = blockbuff[blockpos].reuse + 1;
+        blockbuff[blockpos].size = newnode->size;
+        for (int i = 0; i < NUM_DIRECT; i++) {
+            blockbuff[blockpos].direct[i] = newnode->direct[i];
+        }
+        blockbuff[blockpos].indirect = newnode->indirect;
+
+        WriteSector(block, buff);
+        addInodeToCache(&blockbuff[blockpos], newinodenum);
+        free(buff);
+    }
+
+    isinodetaken[newinodenum] = 1;
+
+    return newinodenum;
+}
+
+
+
+
+
+
+
+
 
 
 /* INODE MANAGEMENT FUNCTIONS */
@@ -211,10 +289,262 @@ struct inode* readInode(int inumber) {
     return return_node;
 }
 
+int blockFromInode(int inodenum) {
+    return (inodenum / inodes_per_block) + 1;
+}
+
+int inodePosInBlock(int inodenum) {
+    return inodenum % inodes_per_block;
+}
+
+int allocInode(struct inode *newnode) {
+    // Alright, here's the plan for this guy:
+    // 1) Pick a free inode (linear scan, this will be efficient enough)
+    // 2) Check if it's in the cache (dummy helper)
+    // 3) If it is in the cache, edit it in the cache and mark it as dirty
+    // 4) If it is not, do the whole read bit, write bit, put it in the cache
+    // 5) Either way, once you're done, mark it as free.
+
+    int newinodenum = -1;
+
+    // Find a free inode
+    for (int i = 1; i < header->num_inodes; i++) {
+        if (!isinodetaken[i]) {
+            newinodenum = i;
+            break;
+        }
+    }
+
+    if (newinodenum == -1) {
+        TracePrintf(1, "WARNING: NO MORE FREE INODES.");
+        return -1;
+    }
+
+    if (inInodeCache(newinodenum)) {
+        editInodeInCache(newnode, newinodenum);
+    } else {
+        int block = blockFromInode(newinodenum);
+        int blockpos = inodePosInBlock(newinodenum);
+
+        void *buff = malloc(SECTORSIZE);
+        ReadSector(block, buff);
+        struct inode *blockbuff = (struct inode*)buff;
+
+        // Change strictly the values that correspond to the specific inode we want to change
+        blockbuff[blockpos].type = newnode->type;
+        blockbuff[blockpos].nlink = newnode->nlink;
+        blockbuff[blockpos].reuse = blockbuff[blockpos].reuse + 1;
+        blockbuff[blockpos].size = newnode->size;
+        for (int i = 0; i < NUM_DIRECT; i++) {
+            blockbuff[blockpos].direct[i] = newnode->direct[i];
+        }
+        blockbuff[blockpos].indirect = newnode->indirect;
+
+        WriteSector(block, buff);
+        addInodeToCache(&blockbuff[blockpos], newinodenum);
+        free(buff);
+    }
+
+    isinodetaken[newinodenum] = 1;
+
+    return newinodenum;
+}
+
+int deallocInode(int nodenum) {
+    // Hopefully, this looks very similar.
+
+    if (inInodeCache(nodenum)) {
+        deallocInodeInCache(nodenum);
+    } else {
+        int block = blockFromInode(nodenum);
+        int blockpos = inodePosInBlock(nodenum);
+
+        void *buff = malloc(SECTORSIZE);
+        ReadSector(block, buff);
+        struct inode *blockbuff = (struct inode*)buff;
+
+        // Change strictly the values that correspond to the specific inode we want to change
+        blockbuff[blockpos].type = INODE_FREE;
+        // I'm not resetting other values; that's your job when you allocate.
+
+        WriteSector(block, buff);
+        addInodeToCache(&blockbuff[blockpos], nodenum);
+        free(buff);
+    }
+
+    isinodetaken[nodenum] = 0;
+
+    // HUGE TODO: YOU NEED TO DEALLOC DATA BLOCKS ASSOCIATED WITH INODE!
+
+    return nodenum;
+}
+
+/* CACHE MANAGEMENT FUNCTIONS */
+
+// Dummy function that, for now, always returns false
+int inInodeCache(int inodenum) {
+    (void)inodenum;
+    return 0;
+}
+
+// Dummy function that, for now, should never be hit
+int addInodeToCache(struct inode *node, int nodenum) {
+    (void)node;
+    (void)nodenum;
+    return -1;
+}
+
+// Dummy function that, for now, should never be hit
+int editInodeInCache(struct inode *node, int nodenum) {
+    (void)node;
+    (void)nodenum;
+    return -1;
+}
+
+int deallocInodeInCache(int nodenum) {
+    (void)nodenum;
+    return -1;
+}
+
+
+
+
+
+
+
+
+
 /* INTERNAL TEST FUNCTIONS */
 
 void printisdbtaken() {
     for(int i = 0; i < dbcount; i++) {
         TracePrintf(5, "printisdbtaken: db %d has value %d.\n", i, isdbtaken[i]);
     }
+}
+
+// Testing inode allocation. This had better extend to data blocks, otherwise I've wasted way too much
+// time on this.
+void testInodeAllocation() {
+    // Count free inodes before allocation
+    int freeInodesBefore = 0;
+    for (int i = 1; i < header->num_inodes; i++) {
+        if (!isinodetaken[i]) {
+            freeInodesBefore++;
+        }
+    }
+    
+    TracePrintf(0, "TEST: Free inodes before allocation: %d\n", freeInodesBefore);
+    
+    // Create a new inode to allocate (empty normal file)
+    struct inode newNode;
+    memset(&newNode, 0, sizeof(struct inode));
+    newNode.type = INODE_REGULAR;
+    newNode.nlink = 1;
+    newNode.size = 0;
+    
+    // allocate
+    int allocatedInum = allocInode(&newNode);
+    
+    if (allocatedInum == -1) {
+        TracePrintf(0, "TEST: Inode allocation failed!\n");
+        return;
+    }
+    
+    TracePrintf(0, "TEST: Allocated inode number: %d\n", allocatedInum);
+    
+    // Count free inodes after allocation
+    int freeInodesAfter = 0;
+    for (int i = 1; i < header->num_inodes; i++) {
+        if (!isinodetaken[i]) {
+            freeInodesAfter++;
+        }
+    }
+    
+    TracePrintf(0, "TEST: Free inodes after allocation: %d\n", freeInodesAfter);
+    
+    // make sure we're only off by one
+    if (freeInodesBefore != freeInodesAfter + 1) {
+        TracePrintf(0, "TEST FAILED: Free inode count mismatch!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Free inode count updated correctly\n");
+    }
+    
+    if (isinodetaken[allocatedInum] != 1) {
+        TracePrintf(0, "TEST FAILED: Allocated inode not marked as taken!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Allocated inode marked as taken\n");
+    }
+    
+    // read the inode back and verify contents
+    struct inode *readNode = readInode(allocatedInum);
+    
+    if (readNode->type != INODE_REGULAR) {
+        TracePrintf(0, "TEST FAILED: Inode type not set correctly! Expected %d, got %d\n", 
+                   INODE_REGULAR, readNode->type);
+    } else {
+        TracePrintf(0, "TEST PASSED: Inode type set correctly\n");
+    }
+    
+    if (readNode->nlink != 1) {
+        TracePrintf(0, "TEST FAILED: Inode nlink not set correctly!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Inode nlink set correctly\n");
+    }
+    
+    // Verify reuse count was incremented (need to know original value for this to work ig)
+    TracePrintf(0, "TEST INFO: Reuse count is now: %d\n", readNode->reuse);
+    
+    free(readNode);
+}
+
+// Testing inode deallocation. Hopefully this flows from the last guy.
+void testInodeDeallocation() {
+    // TODO: MAKE SURE THIS ALSO GETS RID OF DATA BLOCKS
+
+
+    // Count free inodes before allocation
+    int freeInodesBefore = 0;
+    for (int i = 1; i < header->num_inodes; i++) {
+        if (!isinodetaken[i]) {
+            freeInodesBefore++;
+        }
+    }
+
+
+    // Create a new inode to allocate (empty normal file)
+    struct inode newNode;
+    memset(&newNode, 0, sizeof(struct inode));
+    newNode.type = INODE_REGULAR;
+    newNode.nlink = 1;
+    newNode.size = 0;
+    
+    // allocate
+    int allocatedInum = allocInode(&newNode);
+    
+    // deallocate
+    int deallocatedInum = deallocInode(allocatedInum);
+
+    if (deallocatedInum != allocatedInum) {
+        TracePrintf(5, "DEALLOCATION TEST: NODE NUMBERS DON'T MATCH\n");
+    }
+
+    // Count free inodes after deallocation
+    int freeInodesAfter = 0;
+    for (int i = 1; i < header->num_inodes; i++) {
+        if (!isinodetaken[i]) {
+            freeInodesAfter++;
+        }
+    }
+    // Make sure before/after are the same
+    if (freeInodesBefore != freeInodesAfter) {
+        TracePrintf(5, "DEALLOCATION TEST: ALLOCATED INODE COUNTS DON'T MATCH\n");
+    }
+
+    // Check the type of the new inode
+    if (readInode(deallocatedInum)->type != INODE_FREE) {
+        TracePrintf(5, "DEALLOCATION TEST: DEALLOCATED INODE DOES NOT HAVE RIGHT TYPE");
+    } else {
+        TracePrintf(5, "DEALLOCATION TEST: I think it works :)\n");
+    }
+    
 }
