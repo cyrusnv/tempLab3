@@ -20,11 +20,16 @@ struct inode* readInode(int inumber);
 void printisdbtaken();
 void testInodeAllocation();
 void testInodeDeallocation();
+void testBlockAllocation();
+void testBlockDeallocation();
 int inInodeCache(int inodenum);
 int addInodeToCache(struct inode *node, int nodenum);
 int editInodeInCache(struct inode *node, int nodenum);
 int deallocInodeInCache(int nodenum);
-
+int inBlockCache(int bnum);
+int editBlockInCache(int bnum, void *buff);
+int addBlockToCache(int bnum, void *buff);
+int deallocBlockInCache(int bnum);
 
 // The main loop that runs the server
 // As of now, it's set only for basic messages.
@@ -60,6 +65,7 @@ int main(int argc, char *argv[]) {
     setupServer();
     testInodeAllocation();
     testInodeDeallocation();
+    testBlockAllocation();
     
     // Non-child server loop
     while (1) {
@@ -146,8 +152,8 @@ int setupServer() {
 
     // Set up the free data block list
     dbcount = header->num_blocks - header->num_inodes;
-    isdbtaken = (int *)malloc(sizeof(int) * dbcount);
-    memset(isdbtaken, 0, sizeof(int) * dbcount); // initialize all value to zero... part of debugging...
+    isdbtaken = (int *)malloc(sizeof(int) * header->num_blocks);
+    memset(isdbtaken, 0, sizeof(int) * header->num_blocks);
     // Mark used data blocks as used
     // Start with the datablocks that the inodes are in (and the boot block)
     for (int i = 0; i < (header->num_inodes / inodes_per_block) + 1; i++) {
@@ -209,60 +215,83 @@ int setupServer() {
 
 /* BLOCK MANAGEMENT FUNCTIONS */
 
-int allocBlock() {
+/* 
+ * Note that this function does not check that the buffer is the
+ * correct size.
+ */
+int allocBlock(void *buff) {
 
-    int newinodenum = -1;
+    int newblocknum = -1;
 
-    // Find a free inode
-    for (int i = 1; i < header->num_inodes; i++) {
-        if (!isinodetaken[i]) {
-            newinodenum = i;
+    // Find a free block
+    for (int i = 1; i < header->num_blocks; i++) {
+        if (!isdbtaken[i]) {
+            newblocknum = i;
             break;
         }
     }
 
-    if (newinodenum == -1) {
-        TracePrintf(1, "WARNING: NO MORE FREE INODES.");
+    if (newblocknum == -1) {
+        TracePrintf(1, "WARNING: NO MORE FREE BLOCKS.\n");
         return -1;
     }
 
-    if (inInodeCache(newinodenum)) {
-        editInodeInCache(newnode, newinodenum);
+    if (inBlockCache(newblocknum)) {
+        editBlockInCache(newblocknum, buff);
     } else {
-        int block = blockFromInode(newinodenum);
-        int blockpos = inodePosInBlock(newinodenum);
+        // int block = blockFromInode(newblocknum);
+        // int blockpos = inodePosInBlock(newblocknum);
 
-        void *buff = malloc(SECTORSIZE);
-        ReadSector(block, buff);
-        struct inode *blockbuff = (struct inode*)buff;
-
-        // Change strictly the values that correspond to the specific inode we want to change
-        blockbuff[blockpos].type = newnode->type;
-        blockbuff[blockpos].nlink = newnode->nlink;
-        blockbuff[blockpos].reuse = blockbuff[blockpos].reuse + 1;
-        blockbuff[blockpos].size = newnode->size;
-        for (int i = 0; i < NUM_DIRECT; i++) {
-            blockbuff[blockpos].direct[i] = newnode->direct[i];
+        if (sizeof(buff) != SECTORSIZE) {
+            TracePrintf(1, "WARNING: BLOCKALLOC BUFFER SIZE WRONG.\n");
         }
-        blockbuff[blockpos].indirect = newnode->indirect;
 
-        WriteSector(block, buff);
-        addInodeToCache(&blockbuff[blockpos], newinodenum);
-        free(buff);
+        WriteSector(newblocknum, buff);
+        addBlockToCache(newblocknum, buff);
     }
 
-    isinodetaken[newinodenum] = 1;
+    isdbtaken[newblocknum] = 1;
 
-    return newinodenum;
+    return newblocknum;
 }
 
+int deallocBlock(int blocknum) {
 
+    // I guess we should validate the block number.
+    if (blocknum <= 0 || blocknum >= header->num_blocks) {
+        TracePrintf(1, "WARNING: ATTEMPTING TO DEALLOC INVALID BLOCK NUMBER %d\n", blocknum);
+    }
 
+    if (inBlockCache(blocknum)) {
+        deallocBlockInCache(blocknum);
+    }
 
+    isdbtaken[blocknum] = 0;
 
+    return blocknum;
+}
 
+int inBlockCache(int bnum) {
+    (void)bnum;
+    return -1;
+}
 
+int editBlockInCache(int bnum, void *buff) {
+    (void)bnum;
+    (void)buff;
+    return -1;
+}
 
+int addBlockToCache(int bnum, void *buff) {
+    (void)bnum;
+    (void)buff;
+    return -1;
+}
+
+int deallocBlockInCache(int bnum) {
+    (void)bnum;
+    return -1;
+}
 
 
 /* INODE MANAGEMENT FUNCTIONS */
@@ -417,7 +446,7 @@ int deallocInodeInCache(int nodenum) {
 /* INTERNAL TEST FUNCTIONS */
 
 void printisdbtaken() {
-    for(int i = 0; i < dbcount; i++) {
+    for(int i = 0; i < header->num_blocks; i++) {
         TracePrintf(5, "printisdbtaken: db %d has value %d.\n", i, isdbtaken[i]);
     }
 }
@@ -547,4 +576,82 @@ void testInodeDeallocation() {
         TracePrintf(5, "DEALLOCATION TEST: I think it works :)\n");
     }
     
+}
+
+void testBlockAllocation() {
+    // More or less the exact same test as inodes, now with blocks
+
+    // Count free blocks before allocation
+    int freeBlocksBefore = 0;
+    for (int i = 1; i < header->num_blocks; i++) {
+        if (!isdbtaken[i]) {
+            freeBlocksBefore++;
+        }
+    }
+    
+    TracePrintf(0, "TEST: Free blocks before allocation: %d\n", freeBlocksBefore);
+    
+    // Create a test buffer to write
+    void *testBuffer = malloc(SECTORSIZE);
+    if (testBuffer == NULL) {
+        TracePrintf(0, "TEST: Failed to allocate test buffer memory\n");
+        return;
+    }
+    memset(testBuffer, 'A', SECTORSIZE); // Fill buffer with 'A's, which is the grade I want
+    
+    // Allocate the block
+    int allocatedBlock = allocBlock(testBuffer);
+    
+    if (allocatedBlock == -1) {
+        TracePrintf(0, "TEST: Block allocation failed!\n");
+        free(testBuffer);
+        return;
+    }
+    
+    TracePrintf(0, "TEST: Allocated block number: %d\n", allocatedBlock);
+    
+    // Count free blocks after allocation
+    int freeBlocksAfter = 0;
+    for (int i = 1; i < header->num_blocks; i++) {
+        if (!isdbtaken[i]) {
+            freeBlocksAfter++;
+        }
+    }
+    
+    TracePrintf(0, "TEST: Free blocks after allocation: %d\n", freeBlocksAfter);
+    
+    // Make sure we're only off by one
+    if (freeBlocksBefore != freeBlocksAfter + 1) {
+        TracePrintf(0, "TEST FAILED: Free block count mismatch!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Free block count updated correctly\n");
+    }
+    
+    if (isdbtaken[allocatedBlock] != 1) {
+        TracePrintf(0, "TEST FAILED: Allocated block not marked as taken!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Allocated block marked as taken\n");
+    }
+    
+    // Read the block back and verify contents
+    void *readBuffer = malloc(SECTORSIZE);
+    if (readBuffer == NULL) {
+        TracePrintf(0, "TEST: Failed to allocate read buffer memory\n");
+        free(testBuffer);
+        return;
+    }
+    
+    ReadSector(allocatedBlock, readBuffer);
+    
+    // Check if the data matches
+    if (((char*)readBuffer)[0] != 'A') {
+        TracePrintf(0, "TEST FAILED: Block content doesn't match what we wrote! Expected 'A', got '%c'\n", 
+                   ((char*)readBuffer)[0]);
+    } else {
+        TracePrintf(0, "TEST PASSED: Block content matches what we wrote\n");
+    }
+    
+    // Free memory
+    free(testBuffer);
+    free(readBuffer);
 }
