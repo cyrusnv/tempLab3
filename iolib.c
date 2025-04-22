@@ -22,6 +22,8 @@ int TestYFSCommunication() {
         return ERROR;
     }
     
+    TracePrintf(0, "Client: Received reply with data: '%s'\n", msg.data);
+    
     /* At this point, the message has been overwritten with the reply */
     /* Return 0 for success */
     return 0;
