@@ -124,7 +124,7 @@ int setupServer() {
     // TracePrintf(5, "SETUP: second readinode test, inode type is %d\n", firstnode->type);
 
     // Set up the free inode list
-    isinodetaken = (int *)malloc(sizeof(struct inode) * header->num_inodes);
+    isinodetaken = (int *)malloc(sizeof(int) * header->num_inodes);
     // Note that the list needs to begin at 1, since there is no inode 0.
     for (int i = 1; i < header->num_inodes; i++) {
         // this implies that I need a read inode function, huh
@@ -139,7 +139,8 @@ int setupServer() {
 
     // Set up the free data block list
     dbcount = header->num_blocks - header->num_inodes;
-    isdbtaken = (int *)malloc(sizeof(struct inode) * dbcount);
+    isdbtaken = (int *)malloc(sizeof(int) * dbcount);
+    memset(isdbtaken, 0, sizeof(int) * dbcount); // initialize all value to zero... part of debugging...
     // Mark used data blocks as used
     // Start with the datablocks that the inodes are in (and the boot block)
     for (int i = 0; i < (header->num_inodes / inodes_per_block) + 1; i++) {
