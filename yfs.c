@@ -11,13 +11,13 @@
 struct fs_header *header;
 int inodes_per_block = BLOCKSIZE / INODESIZE; // note that this is -1 for the first block due to the header.
 int *isinodetaken = NULL; // inode free list. 1 indicates taken, 0 free. Note that there is nothing in the 0th position, inodes begin at 1.
-int *isdbtaken = NULL; // data block free list. 1 indicates taken, 0 free. Note that there is nothing in the 0th position, inodes begin at 1.
+int *isblocktaken = NULL; // block free list. 1 indicates taken, 0 free. Includes boot block and inode blocks.
 int dbcount = 0; // The number of data blocks in the file system.
 
 // Function headers
 int setupServer();
 struct inode* readInode(int inumber);
-void printisdbtaken();
+void printisblocktaken();
 void testInodeAllocation();
 void testInodeDeallocation();
 void testBlockAllocation();
@@ -152,12 +152,12 @@ int setupServer() {
 
     // Set up the free data block list
     dbcount = header->num_blocks - header->num_inodes;
-    isdbtaken = (int *)malloc(sizeof(int) * header->num_blocks);
-    memset(isdbtaken, 0, sizeof(int) * header->num_blocks);
+    isblocktaken = (int *)malloc(sizeof(int) * header->num_blocks);
+    memset(isblocktaken, 0, sizeof(int) * header->num_blocks);
     // Mark used data blocks as used
     // Start with the datablocks that the inodes are in (and the boot block)
     for (int i = 0; i < (header->num_inodes / inodes_per_block) + 1; i++) {
-        isdbtaken[i] = 1;
+        isblocktaken[i] = 1;
     }
     // Now, iterate over the inodes themselves (again) and update their marked data blocks
     // (I understand that this extra iteration is not necessary, but do not care.)
@@ -168,15 +168,15 @@ int setupServer() {
             // Case 1: we do not have to worry about indirect blocks
             if (fileblockcount <= (NUM_DIRECT)) {
                 for (int j = 0; j < fileblockcount; j++) {
-                    isdbtaken[node->direct[j]] = 1;
+                    isblocktaken[node->direct[j]] = 1;
                 }
             } else { // Case 2: we do have to worry about indirect blocks
                 // Still mark the direct blocks
                 for (int j = 0; j < NUM_DIRECT; j++) {
-                    isdbtaken[node->direct[j]] = 1;
+                    isblocktaken[node->direct[j]] = 1;
                 }
                 // And then also mark the layer of indirect blocks
-                isdbtaken[node->indirect] = 1;
+                isblocktaken[node->indirect] = 1;
                 int remainingblockcount = fileblockcount - NUM_DIRECT;
 
                 // Cast the indirect block into an integer array, per doc spec
@@ -187,7 +187,7 @@ int setupServer() {
                 for (int k = 0; k < remainingblockcount; k++) {
                     // iterate over the numbers in the array, and mark the blocks as taken.
                     if (indirect_blocks[k] > 0) {  // Make sure it's a valid block number lol
-                        isdbtaken[indirect_blocks[k]] = 1;
+                        isblocktaken[indirect_blocks[k]] = 1;
                     }
                 }
             }
@@ -201,7 +201,7 @@ int setupServer() {
     // free(root);
 
     // Testing post-setup.
-    //printisdbtaken();
+    //printisblocktaken();
 
     return 1;
 }
@@ -225,7 +225,7 @@ int allocBlock(void *buff) {
 
     // Find a free block
     for (int i = 1; i < header->num_blocks; i++) {
-        if (!isdbtaken[i]) {
+        if (!isblocktaken[i]) {
             newblocknum = i;
             break;
         }
@@ -242,15 +242,11 @@ int allocBlock(void *buff) {
         // int block = blockFromInode(newblocknum);
         // int blockpos = inodePosInBlock(newblocknum);
 
-        if (sizeof(buff) != SECTORSIZE) {
-            TracePrintf(1, "WARNING: BLOCKALLOC BUFFER SIZE WRONG.\n");
-        }
-
         WriteSector(newblocknum, buff);
         addBlockToCache(newblocknum, buff);
     }
 
-    isdbtaken[newblocknum] = 1;
+    isblocktaken[newblocknum] = 1;
 
     return newblocknum;
 }
@@ -266,14 +262,14 @@ int deallocBlock(int blocknum) {
         deallocBlockInCache(blocknum);
     }
 
-    isdbtaken[blocknum] = 0;
+    isblocktaken[blocknum] = 0;
 
     return blocknum;
 }
 
 int inBlockCache(int bnum) {
     (void)bnum;
-    return -1;
+    return 0;
 }
 
 int editBlockInCache(int bnum, void *buff) {
@@ -445,9 +441,9 @@ int deallocInodeInCache(int nodenum) {
 
 /* INTERNAL TEST FUNCTIONS */
 
-void printisdbtaken() {
+void printisblocktaken() {
     for(int i = 0; i < header->num_blocks; i++) {
-        TracePrintf(5, "printisdbtaken: db %d has value %d.\n", i, isdbtaken[i]);
+        TracePrintf(5, "printisblocktaken: db %d has value %d.\n", i, isblocktaken[i]);
     }
 }
 
@@ -584,7 +580,7 @@ void testBlockAllocation() {
     // Count free blocks before allocation
     int freeBlocksBefore = 0;
     for (int i = 1; i < header->num_blocks; i++) {
-        if (!isdbtaken[i]) {
+        if (!isblocktaken[i]) {
             freeBlocksBefore++;
         }
     }
@@ -613,7 +609,7 @@ void testBlockAllocation() {
     // Count free blocks after allocation
     int freeBlocksAfter = 0;
     for (int i = 1; i < header->num_blocks; i++) {
-        if (!isdbtaken[i]) {
+        if (!isblocktaken[i]) {
             freeBlocksAfter++;
         }
     }
@@ -627,7 +623,7 @@ void testBlockAllocation() {
         TracePrintf(0, "TEST PASSED: Free block count updated correctly\n");
     }
     
-    if (isdbtaken[allocatedBlock] != 1) {
+    if (isblocktaken[allocatedBlock] != 1) {
         TracePrintf(0, "TEST FAILED: Allocated block not marked as taken!\n");
     } else {
         TracePrintf(0, "TEST PASSED: Allocated block marked as taken\n");
