@@ -22,6 +22,8 @@ void testInodeAllocation();
 void testInodeDeallocation();
 void testBlockAllocation();
 void testBlockDeallocation();
+void testSplitPath();
+void test_lookup_in_directory();
 int inInodeCache(int inodenum);
 int addInodeToCache(struct inode *node, int nodenum);
 int editInodeInCache(struct inode *node, int nodenum);
@@ -66,6 +68,9 @@ int main(int argc, char *argv[]) {
     testInodeAllocation();
     testInodeDeallocation();
     testBlockAllocation();
+    testBlockDeallocation();
+    testSplitPath();
+    test_lookup_in_directory();
     
     // Non-child server loop
     while (1) {
@@ -375,6 +380,11 @@ int allocInode(struct inode *newnode) {
     return newinodenum;
 }
 
+/* 
+ * deallocates an inode and the data blocks in it. 
+ * make sure that you don't deallocate an inode that's already free.
+ * Not sure what would happen then. Probably nothing bad.
+ */
 int deallocInode(int nodenum) {
     // Hopefully, this looks very similar.
 
@@ -388,6 +398,39 @@ int deallocInode(int nodenum) {
         ReadSector(block, buff);
         struct inode *blockbuff = (struct inode*)buff;
 
+        /* Free the direct and indirect blocks associated with the inode. */
+
+        // Calculate number of blocks used by this file
+        int fileblockcount = (blockbuff->size + BLOCKSIZE - 1) / BLOCKSIZE;
+        
+        // Free all direct blocks
+        int direct_blocks_to_free = fileblockcount < NUM_DIRECT ? fileblockcount : NUM_DIRECT;
+        for (int i = 0; i < direct_blocks_to_free; i++) {
+            if (blockbuff->direct[i] > 0) {  // Make sure block number is valid
+                deallocBlock(blockbuff[blockpos].direct[i]);
+            }
+        }
+        
+        // Handle indirect blocks if needed
+        if (fileblockcount > NUM_DIRECT && blockbuff->indirect > 0) {
+            // Read the indirect block
+            void* indirect_buffer = malloc(BLOCKSIZE);
+            ReadSector(blockbuff[blockpos].indirect, indirect_buffer);
+            int* indirect_blocks = (int*)indirect_buffer;
+            
+            // Free each block pointed to by the indirect block
+            int indirect_blocks_to_free = fileblockcount - NUM_DIRECT;
+            for (int i = 0; i < indirect_blocks_to_free; i++) {
+                if (indirect_blocks[i] > 0) {  // Make sure block number is valid
+                    deallocBlock(indirect_blocks[i]);
+                }
+            }
+            
+            // Free the indirect block itself
+            deallocBlock(blockbuff[blockpos].indirect);
+            free(indirect_buffer);
+        }
+
         // Change strictly the values that correspond to the specific inode we want to change
         blockbuff[blockpos].type = INODE_FREE;
         // I'm not resetting other values; that's your job when you allocate.
@@ -399,10 +442,16 @@ int deallocInode(int nodenum) {
 
     isinodetaken[nodenum] = 0;
 
-    // HUGE TODO: YOU NEED TO DEALLOC DATA BLOCKS ASSOCIATED WITH INODE!
-
     return nodenum;
 }
+
+
+
+
+
+
+
+
 
 /* CACHE MANAGEMENT FUNCTIONS */
 
@@ -432,6 +481,285 @@ int deallocInodeInCache(int nodenum) {
 }
 
 
+
+
+
+
+/* PATH HANDLING FUNCTIONS */
+
+/*
+ * Splits a pathname into its component parts.
+ * The goal is that I'll then be able to iterate over them
+ */
+char** pathStrToArray(char* path, int* num_components, int* is_absolute) {
+
+    /* OK, here is the plan of attack:
+     * 1) Check if path absolute
+     * 2) Count the number of components
+     * 3) Extract the components and stuff them in an array
+     * 4) Return the array and the number counts
+     * Note: I have completely changed this plan and it does not describe the code. sorry.
+     */
+
+
+    if (path == NULL || num_components == NULL || is_absolute == NULL) {
+        return NULL;
+    }
+    
+    // Check if path is absolute
+    *is_absolute = (path[0] == '/');
+    
+    // Make a copy of the path since strtok modifies the string apparently.
+    char* path_copy = strdup(path);
+    if (path_copy == NULL) {
+        return NULL;
+    }
+    
+    // Count components for array allocation
+    int count = 0;
+    char* temp_copy = strdup(path_copy);
+    char* token = strtok(temp_copy, "/");
+    // I do not like this idiosyncratic function but could not find a better one
+    // Keep tokenizing until we get the sum of the tokens.
+    while (token != NULL) {
+        count++;
+        token = strtok(NULL, "/");
+    }
+    free(temp_copy);
+    
+    // This should also never happen
+    if (count == 0) {
+        free(path_copy);
+        *num_components = 0;
+        return NULL;
+    }
+    
+    // Allocate the array of component strings
+    char** components = (char**)malloc(count * sizeof(char*));
+    if (components == NULL) {
+        free(path_copy);
+        return NULL;
+    }
+    
+    // Tokenize the string again to fill the array lol
+    // I rewrote this to try and do it in one pass but this seems impossible
+    token = strtok(path_copy, "/");
+    int i = 0;
+    while (token != NULL && i < count) {
+        components[i] = strdup(token);
+        i++;
+        token = strtok(NULL, "/");
+    }
+    
+    free(path_copy);
+    *num_components = count;
+    return components;
+}
+
+
+/*
+ * Looks up a component name in a directory. Should be easy, right?
+ */
+int lookup_in_directory(int dir_inode, char* component) {
+    struct inode* dir = readInode(dir_inode);
+    
+    if (dir == NULL) {
+        TracePrintf(1, "ERROR: Could not read directory inode %d\n", dir_inode);
+        return ERROR;
+    }
+    
+    if (dir->type != INODE_DIRECTORY) { // check it's a directory
+        TracePrintf(1, "ERROR: Inode %d is not a directory\n", dir_inode);
+        free(dir);
+        return ERROR;
+    }
+    
+    // Calculate number of directory entries we're dealing with (could be global probably?)
+    int num_entries = dir->size / sizeof(struct dir_entry);
+    int entries_per_block = BLOCKSIZE / sizeof(struct dir_entry);
+    
+    // Block read buffer
+    void* block_buffer = malloc(BLOCKSIZE);
+    if (block_buffer == NULL) {
+        TracePrintf(1, "ERROR: Failed to allocate memory for block buffer\n");
+        free(dir);
+        return ERROR;
+    }
+    
+    int result = -1;  // will contain inode result
+    
+    // Calculate how many data blocksto be read
+    int num_blocks = (num_entries + entries_per_block - 1) / entries_per_block;
+    int blocks_read = 0;
+    
+    // Scan direct blocks
+    for (int i = 0; i < NUM_DIRECT && blocks_read < num_blocks; i++) {
+        if (dir->direct[i] == 0) {
+            continue;
+            // this shouldn't happen really
+        }
+        
+        // Read block
+        if (ReadSector(dir->direct[i], block_buffer) != 0) {
+            TracePrintf(1, "ERROR: Failed to read directory block\n");
+            free(block_buffer);
+            free(dir);
+            return ERROR;
+        }
+        
+        // block is filled with dir entries, so this cast should be safe
+        struct dir_entry* entries = (struct dir_entry*)block_buffer;
+        
+        // Calculate entries in this block (might be partial for last block?)
+        int entries_this_block = (blocks_read == num_blocks - 1) ? 
+                               (num_entries - blocks_read * entries_per_block) : 
+                               entries_per_block; // I'm getting good at this notation, everyone clap
+        
+        // For a given (direct) block
+        for (int j = 0; j < entries_this_block; j++) {
+            // Skip free entries
+            if (entries[j].inum == 0) {
+                continue;
+            }
+            
+            // Corrected name comparison (accounts for hitting nul char right, I think)
+            int match = 1;
+            int k;
+            
+            // Compare characters until we reach a null or DIRNAMELEN
+            for (k = 0; k < DIRNAMELEN; k++) {
+                // At end of component it's a match
+                if (component[k] == '\0') {
+                    break;
+                }
+                
+                // when directory entry name has a null, but component has more chars
+                if (entries[j].name[k] == '\0') {
+                    match = 0;
+                    break;
+                }
+                
+                // just a character mismatch
+                if (entries[j].name[k] != component[k]) {
+                    match = 0;
+                    break;
+                }
+            }
+            
+            // If we reached DIRNAMELEN but component has more characters, also not a match
+            if (k == DIRNAMELEN && component[k] != '\0') {
+                match = 0;
+            }
+            
+            // for once I will be consistent about freeing memory.
+            if (match) {
+                result = entries[j].inum;
+                free(block_buffer);
+                free(dir);
+                return result;
+            }
+        }
+        
+        blocks_read++;
+    }
+    
+    // If directory has more blocks in indirect block, read those too, I hope this works
+    if (blocks_read < num_blocks && dir->indirect != 0) {
+        void* indirect_buffer = malloc(BLOCKSIZE);
+        if (indirect_buffer == NULL) {
+            TracePrintf(1, "ERROR: Failed to allocate memory for indirect block\n");
+            free(block_buffer);
+            free(dir);
+            return ERROR;
+        }
+        
+        // Read indirect block
+        if (ReadSector(dir->indirect, indirect_buffer) != 0) {
+            TracePrintf(1, "ERROR: Failed to read indirect block\n");
+            free(indirect_buffer);
+            free(block_buffer);
+            free(dir);
+            return ERROR;
+        }
+        
+        // it's just an int array
+        int* indirect_blocks = (int*)indirect_buffer;
+        
+        // so scan through the list
+        for (int i = 0; blocks_read < num_blocks; i++) {
+            if (indirect_blocks[i] == 0) {
+                continue;  // Skip empty blocks
+                // I have no idea why this would happen; call it paranoia
+            }
+            
+            // Read the corresponding block
+            if (ReadSector(indirect_blocks[i], block_buffer) != 0) {
+                TracePrintf(1, "ERROR: Failed to read directory block\n");
+                free(indirect_buffer);
+                free(block_buffer);
+                free(dir);
+                return ERROR;
+            }
+
+            // we're now doing stuff similar to direct blocks, but I am rushed and lazy
+            // so I'm copy-pasting instead of some modular solution. sorry.
+            
+            // Cast buffer to directory entries (this is now akin to direct blocks)
+            struct dir_entry* entries = (struct dir_entry*)block_buffer;
+            
+            // Calculate entries in this block (might be partial for last block)
+            int entries_this_block = (blocks_read == num_blocks - 1) ? 
+                                   (num_entries - blocks_read * entries_per_block) : 
+                                   entries_per_block;
+            
+            // Search entries in this block
+            for (int j = 0; j < entries_this_block; j++) {
+                if (entries[j].inum == 0) {
+                    continue;
+                }
+                
+                int match = 1;
+                int k;
+                
+                for (k = 0; k < DIRNAMELEN; k++) {
+                    if (component[k] == '\0') {
+                        break;
+                    }
+                    
+                    if (entries[j].name[k] == '\0') {
+                        match = 0;
+                        break;
+                    }
+                    
+                    if (entries[j].name[k] != component[k]) {
+                        match = 0;
+                        break;
+                    }
+                }
+                
+                if (k == DIRNAMELEN && component[k] != '\0') {
+                    match = 0;
+                }
+                
+                if (match) {
+                    result = entries[j].inum;
+                    free(indirect_buffer);
+                    free(block_buffer);
+                    free(dir);
+                    return result;
+                }
+            }
+            
+            blocks_read++;
+        }
+        
+        free(indirect_buffer);
+    }
+    
+    free(block_buffer);
+    free(dir);
+    return result;  // -1 if not found
+}
 
 
 
@@ -650,4 +978,283 @@ void testBlockAllocation() {
     // Free memory
     free(testBuffer);
     free(readBuffer);
+}
+
+void testBlockDeallocation() {
+    // Allocate a block first
+    void *testBuffer = malloc(SECTORSIZE);
+    memset(testBuffer, 'A', SECTORSIZE);
+    
+    int allocatedBlock = allocBlock(testBuffer);
+    free(testBuffer);
+    
+    if (allocatedBlock == -1) {
+        TracePrintf(0, "TEST: Block allocation failed!\n");
+        return;
+    }
+    
+    // Count free blocks before deallocation
+    int freeBlocksBefore = 0;
+    for (int i = 1; i < header->num_blocks; i++) {
+        if (!isblocktaken[i]) {
+            freeBlocksBefore++;
+        }
+    }
+    
+    // Deallocate the block
+    deallocBlock(allocatedBlock);
+    
+    // Count free blocks after deallocation
+    int freeBlocksAfter = 0;
+    for (int i = 1; i < header->num_blocks; i++) {
+        if (!isblocktaken[i]) {
+            freeBlocksAfter++;
+        }
+    }
+    
+    // Verify we have one more free block
+    if (freeBlocksAfter != freeBlocksBefore + 1) {
+        TracePrintf(0, "TEST FAILED: Free block count mismatch after deallocation!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Block properly deallocated\n");
+    }
+    
+    // Verify the block is marked as free
+    if (isblocktaken[allocatedBlock] != 0) {
+        TracePrintf(0, "TEST FAILED: Deallocated block still marked as taken!\n");
+    } else {
+        TracePrintf(0, "TEST PASSED: Deallocated block marked as free\n");
+    }
+}
+
+void testSplitPath() {
+    struct test_case {
+        char* path;
+        int expected_components;
+        int expected_absolute;
+        char** expected_parts;
+    };
+    
+    // Define test cases
+    // Add to this however you want
+    struct test_case tests[] = {
+        {"/home/user/docs", 3, 1, (char*[]){"home", "user", "docs"}},
+        {"home/user/docs", 3, 0, (char*[]){"home", "user", "docs"}},
+        {"/home//user///docs", 3, 1, (char*[]){"home", "user", "docs"}},
+        {"/", 0, 1, NULL},
+        {"", 0, 0, NULL},
+        {"////", 0, 1, NULL},
+        {"/home/user/", 2, 1, (char*[]){"home", "user"}},
+        {"./test", 2, 0, (char*[]){".", "test"}}
+    };
+    
+    // Dont' touch this stuff
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+    int tests_passed = 0;
+    
+    TracePrintf(1, "Starting pathStrToArray tests...\n");
+    
+    for (int i = 0; i < num_tests; i++) {
+        int num_components;
+        int is_absolute;
+        
+        TracePrintf(1, "Test %d: path=\"%s\"\n", i + 1, tests[i].path);
+        
+        char** components = pathStrToArray(tests[i].path, &num_components, &is_absolute);
+        
+        // Check component count
+        if (num_components != tests[i].expected_components) {
+            TracePrintf(1, "  FAILED: Expected %d components, got %d\n", 
+                   tests[i].expected_components, num_components);
+            goto cleanup;
+        }
+        
+        // Check absolute flag
+        if (is_absolute != tests[i].expected_absolute) {
+            TracePrintf(1, "  FAILED: Expected is_absolute=%d, got %d\n", 
+                   tests[i].expected_absolute, is_absolute);
+            goto cleanup;
+        }
+        
+        // Check components
+        int components_match = 1;
+        for (int j = 0; j < num_components; j++) {
+            if (strcmp(components[j], tests[i].expected_parts[j]) != 0) {
+                TracePrintf(1, "  FAILED: Component %d expected \"%s\", got \"%s\"\n", 
+                       j, tests[i].expected_parts[j], components[j]);
+                components_match = 0;
+                break;
+            }
+        }
+        
+        if (!components_match) {
+            goto cleanup;
+        }
+        
+        TracePrintf(1, "  PASSED\n");
+        tests_passed++;
+        
+    cleanup:
+        // Free memory
+        if (components) {
+            for (int j = 0; j < num_components; j++) {
+                free(components[j]);
+            }
+            free(components);
+        }
+    }
+    
+    TracePrintf(1, "Tests completed: %d/%d passed\n", tests_passed, num_tests);
+}
+
+/**
+ * Tests the lookup_in_directory function
+ */
+void test_lookup_in_directory() {
+    TracePrintf(0, "Starting lookup_in_directory tests...\n");
+    
+    // First, we need to create a test directory to search in
+    struct inode dir_inode;
+    int dir_inode_num;
+    void* block_buffer;
+    struct dir_entry* entries;
+    int block_num;
+    
+    // Initialize the directory inode
+    memset(&dir_inode, 0, sizeof(struct inode));
+    dir_inode.type = INODE_DIRECTORY;
+    dir_inode.nlink = 1;
+    dir_inode.size = 5 * sizeof(struct dir_entry); // Space for 5 entries
+    
+    // Allocate a block for directory entries
+    block_buffer = malloc(BLOCKSIZE);
+    if (block_buffer == NULL) {
+        TracePrintf(0, "TEST FAILED: Could not allocate memory\n");
+        return;
+    }
+    memset(block_buffer, 0, BLOCKSIZE);
+    
+    // Create directory entries in the block
+    entries = (struct dir_entry*)block_buffer;
+    
+    // Entry 1: "."
+    entries[0].inum = 42; // We'll pretend this directory has inode 42
+    strcpy(entries[0].name, ".");
+    
+    // Entry 2: ".."
+    entries[1].inum = 1; // Parent is root
+    strcpy(entries[1].name, "..");
+    
+    // Entry 3: "testfile"
+    entries[2].inum = 100;
+    strcpy(entries[2].name, "testfile");
+    
+    // Entry 4: "longnamefoldr" (exactly DIRNAMELEN - 1 chars + null)
+    entries[3].inum = 101;
+    strcpy(entries[3].name, "longnamefoldr");
+    
+    // Entry 5: Free entry (inum = 0)
+    entries[4].inum = 0;
+    strcpy(entries[4].name, "deleted");
+    
+    // Allocate the block on disk
+    block_num = allocBlock(block_buffer);
+    if (block_num == -1) {
+        TracePrintf(0, "TEST FAILED: Could not allocate block\n");
+        free(block_buffer);
+        return;
+    }
+    
+    // Set the block number in the inode
+    dir_inode.direct[0] = block_num;
+    
+    // Allocate the inode
+    dir_inode_num = allocInode(&dir_inode);
+    if (dir_inode_num == -1) {
+        TracePrintf(0, "TEST FAILED: Could not allocate inode\n");
+        deallocBlock(block_num);
+        free(block_buffer);
+        return;
+    }
+    
+    TracePrintf(0, "Test directory created with inode %d and block %d\n", 
+               dir_inode_num, block_num);
+    
+    // Now test lookup_in_directory
+    struct test_case {
+        char* component;
+        int expected_result;
+    };
+    
+    struct test_case tests[] = {
+        {".", 42},                    // Test case 1: Current directory
+        {"..", 1},                    // Test case 2: Parent directory
+        {"testfile", 100},            // Test case 3: Regular file
+        {"longnamefoldr", 101},       // Test case 4: Long name (DIRNAMELEN-1)
+        {"deleted", -1},              // Test case 5: Deleted entry
+        {"nonexistent", -1},          // Test case 6: Nonexistent entry
+        {"testfil", -1},              // Test case 7: Prefix of existing name
+        {"testfiles", -1},            // Test case 8: Existing name with extra chars
+    };
+    
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+    int tests_passed = 0;
+    
+    for (int i = 0; i < num_tests; i++) {
+        int result = lookup_in_directory(dir_inode_num, tests[i].component);
+        
+        TracePrintf(0, "Test %d: Looking up \"%s\" - ", i + 1, tests[i].component);
+        
+        if (result == tests[i].expected_result) {
+            TracePrintf(0, "PASSED (got %d as expected)\n", result);
+            tests_passed++;
+        } else {
+            TracePrintf(0, "FAILED (expected %d, got %d)\n", 
+                       tests[i].expected_result, result);
+        }
+    }
+    
+    // Test edge case: Test with component exactly DIRNAMELEN chars long
+    char long_name[DIRNAMELEN + 1];
+    memset(long_name, 'a', DIRNAMELEN);
+    long_name[DIRNAMELEN] = '\0';
+    
+    TracePrintf(0, "Test %d: Looking up name of exactly DIRNAMELEN length - ", 
+               num_tests + 1);
+    int result = lookup_in_directory(dir_inode_num, long_name);
+    if (result == -1) {
+        TracePrintf(0, "PASSED (got -1 as expected)\n");
+        tests_passed++;
+    } else {
+        TracePrintf(0, "FAILED (expected -1, got %d)\n", result);
+    }
+    
+    // Test edge case: Non-directory inode
+    struct inode file_inode;
+    int file_inode_num;
+    
+    memset(&file_inode, 0, sizeof(struct inode));
+    file_inode.type = INODE_REGULAR;
+    file_inode_num = allocInode(&file_inode);
+    
+    if (file_inode_num != -1) {
+        TracePrintf(0, "Test %d: Lookup in non-directory inode - ", 
+                   num_tests + 2);
+        result = lookup_in_directory(file_inode_num, "anything");
+        if (result == ERROR) {
+            TracePrintf(0, "PASSED (got ERROR as expected)\n");
+            tests_passed++;
+        } else {
+            TracePrintf(0, "FAILED (expected ERROR, got %d)\n", result);
+        }
+        
+        deallocInode(file_inode_num);
+    }
+    
+    // Clean up
+    deallocInode(dir_inode_num);
+    free(block_buffer);
+    
+    TracePrintf(0, "Lookup tests completed: %d/%d passed\n", 
+               tests_passed, num_tests + 2);
 }
