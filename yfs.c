@@ -23,6 +23,7 @@ void testInodeDeallocation();
 void testBlockAllocation();
 void testBlockDeallocation();
 void testSplitPath();
+void test_path_resolution();
 void test_lookup_in_directory();
 int inInodeCache(int inodenum);
 int addInodeToCache(struct inode *node, int nodenum);
@@ -32,6 +33,8 @@ int inBlockCache(int bnum);
 int editBlockInCache(int bnum, void *buff);
 int addBlockToCache(int bnum, void *buff);
 int deallocBlockInCache(int bnum);
+char** pathStrToArray(char* path, int* num_components, int* is_absolute);
+int lookup_in_directory(int dir_inode, char* component);
 
 // The main loop that runs the server
 // As of now, it's set only for basic messages.
@@ -71,6 +74,7 @@ int main(int argc, char *argv[]) {
     testBlockDeallocation();
     testSplitPath();
     test_lookup_in_directory();
+    test_path_resolution();
     
     // Non-child server loop
     while (1) {
@@ -488,6 +492,111 @@ int deallocInodeInCache(int nodenum) {
 /* PATH HANDLING FUNCTIONS */
 
 /*
+ * This is the primary path handling function. Give it a path, and it should give you everything you want.
+ * It doesn't do that yet. But it will. I promise.
+ */
+int resolve_path(char *path, int current_dir_inode, int *final_inode) {
+    int is_absolute; // from pathstrtoarray; indicates if dealing with an absolute path
+    int num_components; // also from pathstrtoarray
+    char **components; // guess what? pathstrtoarray
+    int working_inode; // note we're currently observing as we descend
+    
+    // Handle NULL path; too easy for a guy like me.
+    if (path == NULL) {
+        return ERROR;
+    }
+    
+    // Empty path or just "/" -- error on first, root for second.
+    if (path[0] == '\0') {
+        return ERROR;
+    }
+    if (strcmp(path, "/") == 0) {
+        *final_inode = ROOTINODE;
+        return 0;  // Success
+    }
+    
+    // Split path into components
+    components = pathStrToArray(path, &num_components, &is_absolute);
+    if (components == NULL) {
+        // either the path is empty... or it's "/"; use abs flag for this case
+        if (is_absolute) {
+            *final_inode = ROOTINODE;
+            return 0;  // Success
+        }
+        return ERROR;
+    }
+    
+    // Start at root or current directory
+    working_inode = is_absolute ? ROOTINODE : current_dir_inode;
+    
+    // Descend down components
+    for (int i = 0; i < num_components; i++) {
+        // Handle . and ..
+        if (strcmp(components[i], ".") == 0) {
+            // Current directory - do nothing(?)
+            continue;
+        } else if (strcmp(components[i], "..") == 0) {
+            // Parent directory - lookup ".." in current directory
+            // note that this isn't as hard as it seems, because every inode should have ".." on conception.
+            int parent_inode = lookup_in_directory(working_inode, "..");
+            if (parent_inode < 0) {
+                // Free components and return ERROR. look how responsible I am at memory management
+                for (int j = 0; j < num_components; j++) {
+                    free(components[j]);
+                }
+                free(components);
+                return ERROR;
+            }
+            working_inode = parent_inode;
+        } else {
+            // Regular component: look it up, get its inode, move on
+            int next_inode = lookup_in_directory(working_inode, components[i]);
+            if (next_inode < 0) {
+                // Component not found
+                for (int j = 0; j < num_components; j++) {
+                    free(components[j]);
+                }
+                free(components);
+                return ERROR;
+            }
+            
+            // Get the inode to check if it's a directory (for all but the last component)
+            if (i < num_components - 1) {
+                struct inode *node = readInode(next_inode);
+                if (node == NULL || node->type != INODE_DIRECTORY) {
+                    // Not a directory but more components to process
+                    if (node != NULL) {
+                        free(node);
+                    }
+                    for (int j = 0; j < num_components; j++) {
+                        free(components[j]);
+                    }
+                    free(components);
+                    return ERROR;
+                }
+                free(node);
+            }
+            
+            working_inode = next_inode;
+        }
+    }
+    
+    *final_inode = working_inode;
+    
+    // Free the components array
+    for (int i = 0; i < num_components; i++) {
+        free(components[i]);
+    }
+    free(components);
+    
+    return 0; // ez dub
+}
+
+
+
+
+
+/*
  * Splits a pathname into its component parts.
  * The goal is that I'll then be able to iterate over them
  */
@@ -630,6 +739,9 @@ int lookup_in_directory(int dir_inode, char* component) {
             for (k = 0; k < DIRNAMELEN; k++) {
                 // At end of component it's a match
                 if (component[k] == '\0') {
+                    if (entries[j].name[k] != '\0') {
+                        match = 0;  // I lied: not a match if directory entry has more characters
+                    }
                     break;
                 }
                 
@@ -722,9 +834,10 @@ int lookup_in_directory(int dir_inode, char* component) {
                 int k;
                 
                 for (k = 0; k < DIRNAMELEN; k++) {
-                    if (component[k] == '\0') {
-                        break;
+                    if (entries[j].name[k] != '\0') {
+                        match = 0;  // I lied: not a match if directory entry has more characters
                     }
+                    break;
                     
                     if (entries[j].name[k] == '\0') {
                         match = 0;
@@ -1257,4 +1370,59 @@ void test_lookup_in_directory() {
     
     TracePrintf(0, "Lookup tests completed: %d/%d passed\n", 
                tests_passed, num_tests + 2);
+}
+
+void test_path_resolution() {
+    TracePrintf(0, "Starting path resolution tests...\n");
+    
+    // Create a test directory structure
+    // (You may want to reuse your test_lookup_in_directory setup)
+    
+    // Test cases
+    struct test_case {
+        char* path;
+        int current_dir;  // Starting directory
+        int expected_result;
+        int expected_error;  // 0 for success, ERROR for failure
+    };
+    
+    struct test_case tests[] = {
+        // Basic cases
+        {"/", ROOTINODE, ROOTINODE, 0},
+        {".", ROOTINODE, ROOTINODE, 0},
+        {"..", ROOTINODE, ROOTINODE, 0},  // Root is its own parent
+        
+        // Add more tests based on your test directory structure
+        // For example, if you create files/directories in setup
+    };
+    
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+    int tests_passed = 0;
+    
+    for (int i = 0; i < num_tests; i++) {
+        int result_inode;
+        int status = resolve_path(tests[i].path, tests[i].current_dir, &result_inode);
+        
+        TracePrintf(0, "Test %d: Path \"%s\" from dir %d - ", 
+                   i + 1, tests[i].path, tests[i].current_dir);
+        
+        if (status == tests[i].expected_error) {
+            if (status == 0 && result_inode == tests[i].expected_result) {
+                TracePrintf(0, "PASSED (got inode %d as expected)\n", result_inode);
+                tests_passed++;
+            } else if (status != 0) {
+                TracePrintf(0, "PASSED (got expected error)\n");
+                tests_passed++;
+            } else {
+                TracePrintf(0, "FAILED (got inode %d, expected %d)\n", 
+                           result_inode, tests[i].expected_result);
+            }
+        } else {
+            TracePrintf(0, "FAILED (got status %d, expected %d)\n", 
+                       status, tests[i].expected_error);
+        }
+    }
+    
+    TracePrintf(0, "Path resolution tests completed: %d/%d passed\n", 
+               tests_passed, num_tests);
 }
